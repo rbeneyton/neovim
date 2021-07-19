@@ -1546,6 +1546,12 @@ static time_t swapfile_info(char *fname)
           msg_outnum(char_to_long(b0.b0_pid));
           if (swapfile_process_running(&b0, fname)) {
             msg_puts(_(" (STILL RUNNING)"));
+            const int pid = (int)char_to_long(b0.b0_pid);
+            char extra_info[512];
+            if (os_proc_tmux_info(pid, extra_info)) {
+              msg_puts(_("\n              tmux: "));
+              msg_puts(extra_info);
+            }
             process_still_running = true;
           }
         }

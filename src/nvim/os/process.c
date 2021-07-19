@@ -38,6 +38,8 @@
 # include <sys/sysctl.h>
 #endif
 
+#include "nvim/os/shell.h"
+
 #ifdef INCLUDE_GENERATED_DECLARATIONS
 # include "os/process.c.generated.h"  // IWYU pragma: export
 #endif
@@ -277,3 +279,159 @@ bool os_proc_running(int pid)
   // other errors the process might be running, assuming it is then.
   return true;
 }
+
+#if defined(__linux__)
+/// Fill given buffer with potential tmux specific information about the pid
+bool os_proc_tmux_info(int pid, char msg[static 512])
+{
+  FILE *fp = NULL;
+  char *buf = NULL;
+  char **argv = NULL;
+  const size_t narg = 13;
+  char *tmux_call_output = NULL;
+
+  char proc_env[256] = { 0 };
+  if (snprintf(proc_env, sizeof(proc_env), "/proc/%d/environ", pid)
+      >= (long)sizeof(proc_env))
+  {
+    return false;
+  }
+
+  // sanity checks
+  struct stat statbuf;
+  if (stat(proc_env, &statbuf) < 0) {
+    return false; // no process any more or no /proc filesystem
+  }
+  if (statbuf.st_size != 0
+  || (statbuf.st_mode & S_IFMT) != S_IFREG)
+  {
+    return false; // unusual /proc filesystem
+  }
+
+  // read environ file
+  fp = fopen(proc_env, "r");
+  if (fp == NULL) return false;
+  size_t buf_sz = 1;
+  size_t sz = 0;
+  const size_t step = 1UL << 10;
+  while (true) {
+    if (buf_sz < sz + step + 1) {
+      buf_sz += step;
+      char *p = xrealloc(buf, buf_sz);
+      if (p == NULL) goto error;
+      buf = p;
+    }
+    const size_t read = fread(buf + sz, 1, step, fp);
+    if (read == 0) {
+      if (feof(fp)) break;
+      if (ferror(fp)) goto error;
+    }
+    sz += read;
+    assert (sz < buf_sz);
+    buf[sz] = '\0'; // fread is \0 string unsafe
+  }
+  fclose(fp);
+  fp = NULL;
+
+  // scan each token and extract tmux related fields
+  char *p = buf;
+  const char *p_end = buf + sz;
+  assert (*p_end == '\0');
+  char *tok;
+  char pane_id[256] = { 0 };
+  char socket_path[256] = { 0 };
+  int server_pid = 0;
+
+  while ((tok = memchr(p, '\0', (size_t)(p_end - p)))) {
+    const char *eq = memchr(p, '=', (size_t)(tok - p));
+    if (eq != NULL) {
+      eq++;
+      const size_t tok_len = (size_t)(eq - p);
+
+      if (strncmp(p, "TMUX_PANE=", tok_len) == 0) {
+        if (sscanf(eq, "%255s", pane_id) != 1
+        ||  strlen(pane_id) == 0)
+        {
+          goto error;
+        }
+      }
+
+      if (strncmp(p, "TMUX=", tok_len) == 0) {
+        // format (undocumented): socket-path,server-pid,...
+        if (sscanf(eq, "%255[^,],%d,", socket_path, &server_pid) != 2
+        ||  strlen(socket_path) == 0
+        ||  server_pid == 0
+        ||  !os_proc_running(server_pid))
+        {
+          goto error;
+        }
+      }
+    }
+    if (tok == p_end) break;
+    p = tok + 1;
+  }
+  xfree(buf);
+  buf = NULL;
+
+  // extract pane information using tmux CLI
+  argv = xmalloc(sizeof(char*) * narg);
+  if (argv == NULL) goto error;
+  memset(argv, 0, sizeof(char*) * narg);
+
+  const size_t warg = 256;
+  for (size_t i = 0; i < narg; i++) {
+      argv[i] = xmalloc(warg);
+      if (argv[i] == NULL) goto error;
+  }
+  size_t idx = 0;
+#define ADD_ARG(...)                                                         \
+  if (snprintf(argv[idx++], warg, __VA_ARGS__) >= (long)warg) {              \
+      goto error;                                                            \
+  }
+
+  // robust against freezed tmux server (rare infinite loop bug)
+  ADD_ARG("/usr/bin/timeout");
+  ADD_ARG("--kill-after=1");
+  ADD_ARG("1s");
+  // use current running server binary to avoid calling random 'tmux' program
+  ADD_ARG("/proc/%d/exe", server_pid);
+  // select corresponding server
+  ADD_ARG("-S");
+  ADD_ARG("%s", socket_path);
+  ADD_ARG("list-panes");
+  // report format "sesion:<session> pane:<id>(<title>) win:<id>"
+  ADD_ARG("-F");
+  ADD_ARG("session `#{session_name}` pane `#{window_index}(#{window_name}).#{pane_index}`");
+  // filter to get corresponding pane_id
+  ADD_ARG("-f");
+  ADD_ARG("#{==:#{pane_id},%s}", pane_id);
+  ADD_ARG("-a");
+#undef ADD_ARG
+  argv[idx++] = NULL;
+  assert (idx == narg);
+
+  if (os_system(argv, NULL, 0, &tmux_call_output, NULL) < 0
+  ||  tmux_call_output == NULL)
+  {
+    argv = NULL; // argv memory ownership given to os_system() so no leak here
+    goto error;
+  }
+  char *tr = strchr(tmux_call_output, '\n');
+  if (tr != NULL) *tr = '\0';
+  const bool res = snprintf(msg, 512, "%s", tmux_call_output) < 512;
+  xfree(tmux_call_output);
+
+  return res;
+
+error:
+  if (fp != NULL) fclose(fp);
+  xfree(buf);
+  if (argv) {
+    for (size_t i = 0; i < narg; i++) xfree(argv[i]);
+    xfree(argv);
+  }
+  xfree(tmux_call_output);
+
+  return false;
+}
+#endif
