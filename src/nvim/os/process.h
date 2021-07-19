@@ -8,4 +8,7 @@
 # include "os/process.h.generated.h"
 #endif
 
+// TODO auto generated?
+bool os_proc_tmux_info(int pid, char msg[static 512]);
+
 #endif  // NVIM_OS_PROCESS_H
