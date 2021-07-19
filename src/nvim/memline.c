@@ -1593,8 +1593,15 @@ static time_t swapfile_info(char_u *fname)
         if (char_to_long(b0.b0_pid) != 0L) {
           msg_puts(_("\n        process ID: "));
           msg_outnum(char_to_long(b0.b0_pid));
-          if (os_proc_running((int)char_to_long(b0.b0_pid))) {
+          const int pid = (int)char_to_long(b0.b0_pid);
+
+          if (os_proc_running(pid)) {
             msg_puts(_(" (STILL RUNNING)"));
+            char extra_info[512];
+            if (os_proc_tmux_info(pid, extra_info)) {
+              msg_puts(_("\n              tmux: "));
+              msg_puts(extra_info);
+            }
             process_still_running = true;
           }
         }
